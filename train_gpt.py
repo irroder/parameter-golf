@@ -255,7 +255,7 @@ def eval_val(
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            with torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=True):
                 batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
@@ -514,18 +514,18 @@ class BioDNA(nn.Module):
             nn.Linear(hidden_dim, max_matrix_dim * rank)
         )
 
-    def grow_weight(self, layer_id: int, type_id: int, out_features: int, in_features: int) -> Tensor:
+    def get_chromosomes(self, layer_id: int, type_id: int, out_features: int, in_features: int) -> tuple[Tensor, Tensor]:
         device = self.layer_genes.weight.device
         gene_expression = self.layer_genes(torch.tensor(layer_id, device=device)) + \
-                          self.type_genes(torch.tensor(type_id, device=device))
+                        self.type_genes(torch.tensor(type_id, device=device))
         
         row_phenotype = self.morphogenesis_row(gene_expression).view(-1, self.rank)
         col_phenotype = self.morphogenesis_col(gene_expression).view(-1, self.rank)
         
         r = row_phenotype[:out_features, :]
         c = col_phenotype[:in_features, :]
-        weight = r @ c.T
-        return weight * (1.0 / math.sqrt(in_features * self.rank))
+        scale = (1.0 / math.sqrt(in_features * self.rank))
+        return r * scale, c
 
 
 class FractalLinear(nn.Module):
@@ -539,8 +539,8 @@ class FractalLinear(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         r, c = self.dna.get_chromosomes(self.layer_id, self.type_id, self.out_features, self.in_features)
-        step1 = F.linear(x, c.t())
-        return F.linear(step1, r)
+        step1 = F.linear(x, c.t()) 
+        return F.linear(step1, r)  
 
 
 class RMSNorm(nn.Module):
@@ -789,9 +789,9 @@ def main() -> None:
     grad_accum_steps = 8 // world_size
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required")
-    device = torch.device("cuda", local_rank)
-    torch.cuda.set_device(device)
+        pass # Взломано
+    device = torch.device("cpu", local_rank)
+    pass # Взломано дважды
     if distributed:
         dist.init_process_group(backend="nccl", device_id=device)
         dist.barrier()
@@ -827,7 +827,7 @@ def main() -> None:
     log0(f"Running Python {sys.version}", console=False)
     log0(f"Running PyTorch {torch.__version__}", console=False)
     log0(
-        subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout,
+        subprocess.run(["echo", "Маковская заглушка"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout,
         console=False,
     )
     log0("=" * 100, console=False)
@@ -876,9 +876,9 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
     for module in base_model.modules():
-        if isinstance(module, CastedLinear):
+        if isinstance(module, FractalLinear):
             module.float()
-    restore_low_dim_params_to_fp32(base_model)
+    # restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -983,7 +983,7 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                with torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
@@ -1005,7 +1005,7 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    torch.cuda.synchronize()
+    pass
     t0 = time.perf_counter()
 
     step = 0
@@ -1014,7 +1014,7 @@ def main() -> None:
 
         should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
         if should_validate:
-            torch.cuda.synchronize()
+            pass
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
             val_loss, val_bpb = eval_val(
                 args,
@@ -1032,7 +1032,7 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
-            torch.cuda.synchronize()
+            pass
             t0 = time.perf_counter()
 
         if last_step:
@@ -1051,7 +1051,7 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            with torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
@@ -1136,7 +1136,7 @@ def main() -> None:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
-    torch.cuda.synchronize()
+    pass
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
         args,
@@ -1150,7 +1150,7 @@ def main() -> None:
         has_leading_space_lut,
         is_boundary_token_lut,
     )
-    torch.cuda.synchronize()
+    pass
     log0(
         f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
