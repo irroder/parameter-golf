@@ -255,7 +255,7 @@ def eval_val(
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
-            with torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=True):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
@@ -498,26 +498,41 @@ class DistributedTokenLoader:
 # -----------------------------
 
 class BioDNA(nn.Module):
+
     def __init__(self, max_layers=30, max_types=10, dna_dim=32, hidden_dim=64, rank=16, max_matrix_dim=2048):
+
         super().__init__()
+
         self.rank = rank
+
         self.layer_genes = nn.Embedding(max_layers, dna_dim)
+
         self.type_genes = nn.Embedding(max_types, dna_dim)
+
         self.morphogenesis_row = nn.Sequential(
+
             nn.Linear(dna_dim, hidden_dim),
+
             nn.SiLU(),
+
             nn.Linear(hidden_dim, max_matrix_dim * rank)
-        )
-        self.morphogenesis_col = nn.Sequential(
-            nn.Linear(dna_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, max_matrix_dim * rank)
+
         )
 
+        self.morphogenesis_col = nn.Sequential(
+
+            nn.Linear(dna_dim, hidden_dim),
+
+            nn.SiLU(),
+
+            nn.Linear(hidden_dim, max_matrix_dim * rank)
+
+        )
+
+
+
     def get_chromosomes(self, layer_id: int, type_id: int, out_features: int, in_features: int) -> tuple[Tensor, Tensor]:
-        device = self.layer_genes.weight.device
-        gene_expression = self.layer_genes(torch.tensor(layer_id, device=device)) + \
-                        self.type_genes(torch.tensor(type_id, device=device))
+        gene_expression = self.layer_genes.weight[layer_id] + self.type_genes.weight[type_id]
         
         row_phenotype = self.morphogenesis_row(gene_expression).view(-1, self.rank)
         col_phenotype = self.morphogenesis_col(gene_expression).view(-1, self.rank)
@@ -528,239 +543,484 @@ class BioDNA(nn.Module):
         return r * scale, c
 
 
+
+
 class FractalLinear(nn.Module):
+
     def __init__(self, dna: BioDNA, layer_id: int, type_id: int, in_features: int, out_features: int):
+
         super().__init__()
+
         self.dna = dna
+
         self.layer_id = layer_id
+
         self.type_id = type_id
+
         self.in_features = in_features
+
         self.out_features = out_features
 
+
+
     def forward(self, x: Tensor) -> Tensor:
+
         r, c = self.dna.get_chromosomes(self.layer_id, self.type_id, self.out_features, self.in_features)
-        step1 = F.linear(x, c.t()) 
+
+        step1 = F.linear(x, c.t())
+
         return F.linear(step1, r)  
 
 
+
+
+
 class RMSNorm(nn.Module):
+
     def __init__(self, eps: float | None = None):
+
         super().__init__()
+
         self.eps = eps
 
+
+
     def forward(self, x: Tensor) -> Tensor:
+
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+
+
+
 class Rotary(nn.Module):
+
     def __init__(self, dim: int, base: float = 10000.0):
+
         super().__init__()
+
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+
         self._seq_len_cached = 0
+
         self._cos_cached: Tensor | None = None
+
         self._sin_cached: Tensor | None = None
 
+
+
     def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+
         if (
+
             self._cos_cached is None
+
             or self._sin_cached is None
+
             or self._seq_len_cached != seq_len
+
             or self._cos_cached.device != device
+
         ):
+
             t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+
             freqs = torch.outer(t, self.inv_freq.to(device))
+
             self._cos_cached = freqs.cos()[None, None, :, :]
+
             self._sin_cached = freqs.sin()[None, None, :, :]
+
             self._seq_len_cached = seq_len
+
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
 
+
+
+
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+
     half = x.size(-1) // 2
+
     x1, x2 = x[..., :half], x[..., half:]
+
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
+
+
+
 class CausalSelfAttention(nn.Module):
+
     def __init__(
+
         self,
+
         dna: BioDNA,
+
         layer_id: int,
+
         dim: int,
+
         num_heads: int,
+
         num_kv_heads: int,
+
         rope_base: float,
+
         qk_gain_init: float,
+
     ):
+
         super().__init__()
+
         if dim % num_heads != 0:
+
             raise ValueError("model_dim must be divisible by num_heads")
+
         if num_heads % num_kv_heads != 0:
+
             raise ValueError("num_heads must be divisible by num_kv_heads")
-        
+
+       
+
         self.num_heads = num_heads
+
         self.num_kv_heads = num_kv_heads
+
         self.head_dim = dim // num_heads
+
         if self.head_dim % 2 != 0:
+
             raise ValueError("head_dim must be even for RoPE")
-            
+
+           
+
         kv_dim = self.num_kv_heads * self.head_dim
-        
+
+       
+
         self.c_q = FractalLinear(dna, layer_id, 0, dim, dim)
+
         self.c_k = FractalLinear(dna, layer_id, 1, dim, kv_dim)
+
         self.c_v = FractalLinear(dna, layer_id, 2, dim, kv_dim)
+
         self.proj = FractalLinear(dna, layer_id, 3, dim, dim)
-        
+
+       
+
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
+
+
     def forward(self, x: Tensor) -> Tensor:
+
         bsz, seqlen, dim = x.shape
+
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        
+
+       
+
         q = F.rms_norm(q, (q.size(-1),))
+
         k = F.rms_norm(k, (k.size(-1),))
+
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
+
         q = apply_rotary_emb(q, cos, sin)
+
         k = apply_rotary_emb(k, cos, sin)
+
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        
+
+       
+
+        if self.num_kv_heads != self.num_heads:
+
+            num_queries_per_kv = self.num_heads // self.num_kv_heads
+
+            k = k.repeat_interleave(num_queries_per_kv, dim=1)
+
+            v = v.repeat_interleave(num_queries_per_kv, dim=1)
+
+
+
         y = F.scaled_dot_product_attention(
+
             q,
+
             k,
+
             v,
+
             attn_mask=None,
+
             is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
+
+            enable_gqa=False,
+
         )
+
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+
         return self.proj(y)
 
 
+
+
+
 class MLP(nn.Module):
+
     def __init__(self, dna: BioDNA, layer_id: int, dim: int, mlp_mult: int):
+
         super().__init__()
+
         hidden = mlp_mult * dim
+
         self.fc = FractalLinear(dna, layer_id, 4, dim, hidden)
+
         self.proj = FractalLinear(dna, layer_id, 5, hidden, dim)
 
+
+
     def forward(self, x: Tensor) -> Tensor:
+
         x = torch.relu(self.fc(x))
+
         return self.proj(x.square())
 
 
+
+
+
 class Block(nn.Module):
+
     def __init__(
+
         self,
+
         dna: BioDNA,
+
         layer_id: int,
+
         dim: int,
+
         num_heads: int,
+
         num_kv_heads: int,
+
         mlp_mult: int,
+
         rope_base: float,
+
         qk_gain_init: float,
+
     ):
+
         super().__init__()
+
         self.attn_norm = RMSNorm()
+
         self.mlp_norm = RMSNorm()
+
         self.attn = CausalSelfAttention(dna, layer_id, dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+
         self.mlp = MLP(dna, layer_id, dim, mlp_mult)
+
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
+
+
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+
         mix = self.resid_mix.to(dtype=x.dtype)
+
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+
         attn_out = self.attn(self.attn_norm(x))
+
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+
         return x
 
 
+
+
+
 class GPT(nn.Module):
+
     def __init__(
+
         self,
+
         vocab_size: int,
+
         num_layers: int,
+
         model_dim: int,
+
         num_heads: int,
+
         num_kv_heads: int,
+
         mlp_mult: int,
+
         tie_embeddings: bool,
+
         tied_embed_init_std: float,
+
         logit_softcap: float,
+
         rope_base: float,
+
         qk_gain_init: float,
+
     ):
+
         super().__init__()
+
         if logit_softcap <= 0.0:
+
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
-            
+
+           
+
         self.tie_embeddings = tie_embeddings
+
         self.tied_embed_init_std = tied_embed_init_std
+
         self.logit_softcap = logit_softcap
-        
+
+       
+
         max_dim = max(vocab_size, model_dim * mlp_mult)
+
         self.dna = BioDNA(max_layers=num_layers+1, max_types=10, dna_dim=32, hidden_dim=64, rank=16, max_matrix_dim=max_dim)
-        
+
+       
+
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+
         self.num_encoder_layers = num_layers // 2
+
         self.num_decoder_layers = num_layers - self.num_encoder_layers
+
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        
+
+       
+
         self.blocks = nn.ModuleList(
+
             [
+
                 Block(
+
                     self.dna,
+
                     i,
+
                     model_dim,
+
                     num_heads,
+
                     num_kv_heads,
+
                     mlp_mult,
+
                     rope_base,
+
                     qk_gain_init,
+
                 )
+
                 for i in range(num_layers)
+
             ]
+
         )
+
         self.final_norm = RMSNorm()
+
         self.lm_head = None if tie_embeddings else FractalLinear(self.dna, num_layers, 6, model_dim, vocab_size)
+
         self._init_weights()
 
+
+
     def _init_weights(self) -> None:
+
         if self.tie_embeddings:
+
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
 
+
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+
         x = self.tok_emb(input_ids)
+
         x = F.rms_norm(x, (x.size(-1),))
+
         x0 = x
+
         skips: list[Tensor] = []
 
+
+
         for i in range(self.num_encoder_layers):
+
             x = self.blocks[i](x, x0)
+
             skips.append(x)
-            
+
+           
+
         for i in range(self.num_decoder_layers):
+
             if skips:
+
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
+
+
         x = self.final_norm(x).reshape(-1, x.size(-1))
+
         targets = target_ids.reshape(-1)
-        
+
+       
+
         if self.tie_embeddings:
+
             logits_proj = F.linear(x, self.tok_emb.weight.to(x.dtype))
+
         else:
+
             logits_proj = self.lm_head(x)
-            
+
+           
+
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 # -----------------------------
@@ -790,10 +1050,10 @@ def main() -> None:
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         pass # Взломано
-    device = torch.device("cpu", local_rank)
+    device = torch.device("cuda", local_rank)
     pass # Взломано дважды
     if distributed:
-        dist.init_process_group(backend="nccl", device_id=device)
+        dist.init_process_group(backend="gloo", device_id=device)
         dist.barrier()
     master_process = rank == 0
 
@@ -804,8 +1064,8 @@ def main() -> None:
 
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    enable_mem_efficient_sdp(True)
+    enable_math_sdp(True)
 
     logfile = None
     if master_process:
@@ -827,7 +1087,7 @@ def main() -> None:
     log0(f"Running Python {sys.version}", console=False)
     log0(f"Running PyTorch {torch.__version__}", console=False)
     log0(
-        subprocess.run(["echo", "Маковская заглушка"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout,
+        "RTX 4070 VVVVIIUUUU",
         console=False,
     )
     log0("=" * 100, console=False)
@@ -983,7 +1243,8 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                with torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=True):
+                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
@@ -1051,7 +1312,8 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            with torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=True):
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
